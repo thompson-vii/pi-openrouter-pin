@@ -95,8 +95,11 @@ export async function performPin(
 
     // Register the FULL model list: registerProvider with `models` replaces
     // all models for the provider, so registering just the new pin would
-    // silently drop previously pinned models from the live registry.
-    pi.registerProvider(built.providerName, providerEntry);
+    // silently drop previously pinned models from the live registry. Inject
+    // the resolved key so the pin is usable in this session (models.json
+    // keeps the env reference; startup re-registers with the stored
+    // `openrouter` credential — see index.ts).
+    pi.registerProvider(built.providerName, apiKey ? { ...providerEntry, apiKey } : providerEntry);
 
     const defaultSuffix = built.settingsPatch ? " and set as default" : "";
     ctx.notify(`Pinned ${built.providerName}/${opts.modelId}${defaultSuffix}.`, "info");
