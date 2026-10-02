@@ -21,21 +21,80 @@
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { CATALOG_CACHE_TTL_MS, ENDPOINT_CACHE_TTL_MS, OpenRouterClient } from "./api.ts";
+import { CATALOG_CACHE_TTL_MS, ENDPOINT_CACHE_TTL_MS, OpenRouterClient, PROVIDER_PREFIX } from "./api.ts";
 import { isHelpRequest, parsePinArgs, PIN_HELP, PINS_HELP, UNPIN_HELP } from "./args.ts";
 import { makePinCompletions } from "./completions.ts";
 import { formatRouting, formatRefreshDiff, listPins, performPin, performUnpin, refreshPinnedModels } from "./commands.ts";
 import { providerNameFor } from "./config.ts";
+import { stripJsonComments, type ModelsJson } from "./files.ts";
 import { pickFromList } from "./ui.ts";
 import { runWizard } from "./wizard.ts";
 import { resolveOpenRouterApiKey } from "./api.ts";
+
+/**
+ * The OpenRouter API key from the environment or pi's stored `openrouter`
+ * credential (`~/.pi/agent/auth.json`). Read directly because the extension
+ * factory runs before any ModelRegistry exists; pin-time validation and the
+ * startup refresh still use registry-based resolution.
+ *
+ * Pins are separate providers (`openrouter-<slug>`) whose models.json entry
+ * only carries `apiKey: "$OPENROUTER_API_KEY"`. A key saved with `/login` is
+ * stored under the built-in `openrouter` provider, so without this the pinned
+ * provider would have no auth, its models would never become available, and
+ * `enabledModels` would warn "No models match pattern".
+ */
+function readOpenRouterApiKey(agentDir: string): string | undefined {
+  const env = process.env.OPENROUTER_API_KEY?.trim();
+  if (env) return env;
+  try {
+    const raw = readFileSync(join(agentDir, "auth.json"), "utf-8");
+    const auth = JSON.parse(raw) as Record<string, { key?: unknown } | undefined>;
+    const key = auth?.openrouter?.key;
+    return typeof key === "string" && key.trim() ? key.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Re-register every `openrouter-*` pin from models.json with the resolved
+ * OpenRouter credential so pinned providers inherit the same auth as the
+ * built-in `openrouter` provider. Only synchronous file reads happen here (no
+ * network, no writes), so it is safe in the extension factory for invocations
+ * that never start a session (`pi --list-models`, `--help`, RPC health
+ * checks). Staying synchronous keeps command/event registration from being
+ * delayed behind an await.
+ */
+function registerPinnedProviders(
+  pi: ExtensionAPI,
+  modelsPath: string,
+  apiKey: string | undefined,
+): void {
+  let models: ModelsJson | null;
+  try {
+    models = JSON.parse(stripJsonComments(readFileSync(modelsPath, "utf-8"))) as ModelsJson;
+  } catch {
+    return; // a missing or malformed models.json must not break the whole extension
+  }
+  for (const [name, entry] of Object.entries(models?.providers ?? {})) {
+    if (!name.startsWith(PROVIDER_PREFIX)) continue;
+    if (!Array.isArray(entry?.models) || entry.models.length === 0) continue;
+    pi.registerProvider(name, apiKey ? { ...entry, apiKey } : entry);
+  }
+}
 
 export default function openrouterPinExtension(pi: ExtensionAPI) {
   const agentDir = getAgentDir();
   const modelsPath = join(agentDir, "models.json");
   const settingsPath = join(agentDir, "settings.json");
   const client = new OpenRouterClient(CATALOG_CACHE_TTL_MS, ENDPOINT_CACHE_TTL_MS);
+
+  // Pinned providers need the `openrouter` credential injected; see
+  // readOpenRouterApiKey. Done synchronously in the factory so the models are
+  // registered before startup continues and before `pi --list-models` prints.
+  registerPinnedProviders(pi, modelsPath, readOpenRouterApiKey(agentDir));
 
   // Refresh pinned model pricing & limits (cost, contextWindow, maxTokens) at
   // session start. Deliberately NOT in the factory: factories run in
