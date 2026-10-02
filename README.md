@@ -81,6 +81,13 @@ Remove a pinned model and its provider configuration.
 /openrouter-unpin <model-id>
 ```
 
+Unpinning also prunes `settings.json`: the model's `enabledModels` entry and,
+if the default model pointed at that pin, `defaultProvider`/`defaultModel` are
+dropped too. A leftover entry makes pi warn `No models match pattern
+"openrouter-<provider>/<model>"` at every startup. Any such dangling entry —
+including ones left by older versions of this extension — is cleaned up once at
+session start.
+
 ## How It Works
 
 * **Per-Endpoint Pricing Truth**: OpenRouter's catalog pricing is an aggregate
@@ -90,6 +97,9 @@ Remove a pinned model and its provider configuration.
 * **Startup Drift Sync**: On pi launch, pinned models refresh their pricing and
   context limits against OpenRouter's catalog, updating fields atomically if
   upstream parameters change.
+* **Startup Settings Repair**: On pi launch, `enabledModels` refs and the
+  default model that point at a pin `models.json` no longer defines are removed,
+  so a stale pin cannot turn into a startup warning.
 * **Pi-Native Persistence**: Modifies standard `models.json` and
   `settings.json` with atomic writes, preserving formatting and comments.
 

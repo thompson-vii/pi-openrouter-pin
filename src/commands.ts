@@ -21,6 +21,20 @@ import {
 } from "./config.ts";
 import { atomicWriteJson, readJsonFile, type ModelsJson, type ProviderEntry, type SettingsJson } from "./files.ts";
 
+/**
+ * Split a `"<provider>/<model-id>"` reference. Model ids contain slashes
+ * (`z-ai/glm-5.2`), so only the FIRST slash separates the two halves.
+ * Returns null for anything that is not a reference (no slash, empty half) —
+ * and for glob patterns (e.g. `openrouter-<provider>/<star>`), which name many
+ * models rather than one and therefore cannot be resolved against a pin.
+ */
+function splitModelRef(ref: string): { provider: string; modelId: string } | null {
+  if (ref.includes("*") || ref.includes("?")) return null;
+  const i = ref.indexOf("/");
+  if (i <= 0 || i === ref.length - 1) return null;
+  return { provider: ref.slice(0, i), modelId: ref.slice(i + 1) };
+}
+
 export function formatRouting(r: OpenRouterRouting): string {
   const parts: string[] = [];
   if (r.only && r.only.length > 0) parts.push(`only=${r.only.join(",")}`);
@@ -135,15 +149,17 @@ export async function listPins(modelsPath: string): Promise<Array<{ provider: st
 /**
  * Pure: remove a model id from every openrouter-* provider in a models.json
  * snapshot. Providers left with zero models are dropped entirely;
- * non-openrouter providers are never touched. Returns the pruned snapshot
- * and whether anything was removed. Never mutates its input.
+ * non-openrouter providers are never touched. Returns the pruned snapshot,
+ * whether anything was removed, and which providers it was removed from —
+ * the caller needs those names to prune the matching settings.json refs.
+ * Never mutates its input.
  */
 export function unpinFromModels(
   models: ModelsJson | null,
   modelId: string,
-): { models: ModelsJson; removed: boolean } {
+): { models: ModelsJson; removed: boolean; providers: string[] } {
   const providers: Record<string, ProviderEntry> = {};
-  let removed = false;
+  const removedFrom: string[] = [];
   for (const [name, provider] of Object.entries(models?.providers ?? {})) {
     if (!name.startsWith(PROVIDER_PREFIX)) {
       providers[name] = provider;
@@ -154,18 +170,141 @@ export function unpinFromModels(
     if (next.length === list.length) {
       providers[name] = provider;
     } else {
-      removed = true;
+      removedFrom.push(name);
       // Only clone the entries that actually change; a provider left empty is
       // dropped rather than persisted as `models: []`.
       if (next.length > 0) providers[name] = { ...provider, models: next };
     }
   }
-  return { models: { ...models, providers }, removed };
+  return { models: { ...models, providers }, removed: removedFrom.length > 0, providers: removedFrom };
+}
+
+/**
+ * Pure: drop the settings.json entries that stop resolving once `modelId` is
+ * unpinned from `providers` — otherwise pi warns "No models match pattern
+ * \"<provider>/<id>\" on every startup, since the pin is gone from
+ * models.json but still listed as enabled:
+ *
+ *   - `enabledModels`: the `provider/modelId` refs for exactly those
+ *     providers (an entry for a provider that still holds the id is kept,
+ *     since it still resolves).
+ *   - `defaultProvider`/`defaultModel`: cleared together when the default
+ *     pointed at the pin that just went away.
+ *
+ * Returns a new settings object plus whether anything changed and whether the
+ * dangling default was cleared. Never mutates its input, and returns
+ * `changed: false` for a missing/empty settings.json so no file is created.
+ */
+export function unpinFromSettings(
+  settings: SettingsJson | null,
+  modelId: string,
+  providers: string[],
+): { settings: SettingsJson; changed: boolean; clearedDefault: boolean } {
+  const next: SettingsJson = { ...(settings ?? {}) };
+  const names = new Set(providers);
+  let changed = false;
+
+  const enabled = Array.isArray(next.enabledModels) ? next.enabledModels : undefined;
+  if (enabled) {
+    const kept = enabled.filter((ref) => {
+      const parsed = splitModelRef(ref);
+      return !(parsed && names.has(parsed.provider) && parsed.modelId === modelId);
+    });
+    if (kept.length !== enabled.length) {
+      next.enabledModels = kept;
+      changed = true;
+    }
+  }
+
+  const clearedDefault =
+    typeof next.defaultProvider === "string" &&
+    names.has(next.defaultProvider) &&
+    next.defaultModel === modelId;
+  if (clearedDefault) {
+    delete next.defaultProvider;
+    delete next.defaultModel;
+    changed = true;
+  }
+  return { settings: next, changed, clearedDefault };
+}
+
+/**
+ * Pure: the settings.json self-heal for pins that are already dangling —
+ * `enabledModels` refs and the default model pointing at an `openrouter-*`
+ * provider/model that models.json no longer defines (e.g. unpinned by an older
+ * version of this extension, or removed by hand). Such refs make pi warn "No
+ * models match pattern" at every startup.
+ *
+ * Deliberately conservative: only entries whose provider is in this
+ * extension's own `openrouter-*` namespace are considered, only exact
+ * `provider/model` refs are dropped (globs still name live models), and
+ * non-openrouter entries are never touched. Never mutates its input.
+ */
+export function reconcileSettings(
+  models: ModelsJson | null,
+  settings: SettingsJson | null,
+): { settings: SettingsJson; removed: string[]; clearedDefault: boolean } {
+  const next: SettingsJson = { ...(settings ?? {}) };
+  const available = new Set<string>();
+  for (const [name, provider] of Object.entries(models?.providers ?? {})) {
+    if (!name.startsWith(PROVIDER_PREFIX)) continue;
+    for (const m of Array.isArray(provider?.models) ? provider.models : []) available.add(`${name}/${m.id}`);
+  }
+
+  const removed: string[] = [];
+  const enabled = Array.isArray(next.enabledModels) ? next.enabledModels : undefined;
+  if (enabled) {
+    const kept = enabled.filter((ref) => {
+      const parsed = splitModelRef(ref);
+      const dangling = parsed !== null && parsed.provider.startsWith(PROVIDER_PREFIX) && !available.has(ref);
+      if (dangling) removed.push(ref);
+      return !dangling;
+    });
+    if (removed.length > 0) next.enabledModels = kept;
+  }
+
+  const provider = typeof next.defaultProvider === "string" ? next.defaultProvider : undefined;
+  const clearedDefault =
+    provider !== undefined &&
+    provider.startsWith(PROVIDER_PREFIX) &&
+    (typeof next.defaultModel !== "string" || !available.has(`${provider}/${next.defaultModel}`));
+  if (clearedDefault) {
+    delete next.defaultProvider;
+    delete next.defaultModel;
+  }
+  return { settings: next, removed, clearedDefault };
+}
+
+export interface SettingsHeal {
+  /** Dangling `enabledModels` refs that were dropped. */
+  removed: string[];
+  clearedDefault: boolean;
+}
+
+/**
+ * Edge: reconcile settings.json against models.json, writing it only when
+ * something was actually dangling. A missing settings.json is never created.
+ */
+export async function reconcilePinnedSettings(modelsPath: string, settingsPath: string): Promise<SettingsHeal> {
+  const settings = await readJsonFile<SettingsJson>(settingsPath);
+  if (!settings) return { removed: [], clearedDefault: false };
+  const models = await readJsonFile<ModelsJson>(modelsPath);
+  const healed = reconcileSettings(models, settings);
+  if (healed.removed.length === 0 && !healed.clearedDefault) return { removed: [], clearedDefault: false };
+  await atomicWriteJson(settingsPath, healed.settings);
+  return { removed: healed.removed, clearedDefault: healed.clearedDefault };
 }
 
 /** Result of /openrouter-unpin: three explicit arms, each with its own notice. */
 export type UnpinOutcome =
-  | { status: "removed" }
+  | {
+      status: "removed";
+      /** The openrouter-* providers the model was removed from. */
+      providers: string[];
+      /** Whether settings.json was rewritten (stale enabledModels/default dropped). */
+      settingsChanged: boolean;
+      clearedDefault: boolean;
+    }
   | { status: "no-providers" } // models.json missing, or has no providers key
   | { status: "not-found" }; // providers exist, but the model is not pinned
 
@@ -174,14 +313,33 @@ export type UnpinOutcome =
  * and write the pruned file only when something was actually removed. A
  * missing file or a model that is not pinned never creates or rewrites
  * models.json.
+ *
+ * settings.json is pruned in the same step: the `enabledModels` refs and the
+ * default model that pointed at the pin are removed, since a leftover ref
+ * makes pi warn "No models match pattern" at every startup. models.json is
+ * written first — the reverse order could drop a live pin from the model's
+ * list if the process died between the two writes.
  */
-export async function performUnpin(modelsPath: string, modelId: string): Promise<UnpinOutcome> {
+export async function performUnpin(
+  modelsPath: string,
+  settingsPath: string,
+  modelId: string,
+): Promise<UnpinOutcome> {
   const models = await readJsonFile<ModelsJson>(modelsPath);
   if (!models?.providers) return { status: "no-providers" };
-  const { models: pruned, removed } = unpinFromModels(models, modelId);
+  const { models: pruned, removed, providers } = unpinFromModels(models, modelId);
   if (!removed) return { status: "not-found" };
   await atomicWriteJson(modelsPath, pruned);
-  return { status: "removed" };
+
+  const settings = await readJsonFile<SettingsJson>(settingsPath);
+  const prunedSettings = unpinFromSettings(settings, modelId, providers);
+  if (prunedSettings.changed) await atomicWriteJson(settingsPath, prunedSettings.settings);
+  return {
+    status: "removed",
+    providers,
+    settingsChanged: prunedSettings.changed,
+    clearedDefault: prunedSettings.clearedDefault,
+  };
 }
 
 // ---------------------------------------------------------------------------

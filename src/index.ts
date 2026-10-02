@@ -18,6 +18,11 @@
  *   /openrouter-unpin <model>                             one-shot
  *   /openrouter-unpin                                     pick from existing pins
  *   /openrouter-pins                                      list pins (verbose view)
+ *
+ * Unpinning prunes settings.json too: the `enabledModels` ref (and the
+ * default model, if it pointed there) is dropped along with the pin, and any
+ * such refs left over from older versions are healed at session start —
+ * a dangling ref makes pi warn "No models match pattern" at every startup.
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -26,7 +31,15 @@ import { join } from "node:path";
 import { CATALOG_CACHE_TTL_MS, ENDPOINT_CACHE_TTL_MS, OpenRouterClient, PROVIDER_PREFIX } from "./api.ts";
 import { isHelpRequest, parsePinArgs, PIN_HELP, PINS_HELP, UNPIN_HELP } from "./args.ts";
 import { makePinCompletions } from "./completions.ts";
-import { formatRouting, formatRefreshDiff, listPins, performPin, performUnpin, refreshPinnedModels } from "./commands.ts";
+import {
+  formatRouting,
+  formatRefreshDiff,
+  listPins,
+  performPin,
+  performUnpin,
+  reconcilePinnedSettings,
+  refreshPinnedModels,
+} from "./commands.ts";
 import { providerNameFor } from "./config.ts";
 import { stripJsonComments, type ModelsJson } from "./files.ts";
 import { pickFromList } from "./ui.ts";
@@ -95,6 +108,29 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
   // readOpenRouterApiKey. Done synchronously in the factory so the models are
   // registered before startup continues and before `pi --list-models` prints.
   registerPinnedProviders(pi, modelsPath, readOpenRouterApiKey(agentDir));
+
+  pi.on("session_start", (_event, ctx) => {
+    // Self-heal settings.json first: refs in `enabledModels` (or the default
+    // model) pointing at an openrouter-* provider/model that models.json no
+    // longer defines make pi warn "No models match pattern" at every startup.
+    // Older versions of this extension left such refs behind when unpinning,
+    // so existing configs need healing too.
+    void reconcilePinnedSettings(modelsPath, settingsPath)
+      .then((healed) => {
+        if (healed.removed.length === 0 && !healed.clearedDefault) return;
+        const parts: string[] = [];
+        if (healed.removed.length > 0) {
+          parts.push(
+            `removed ${healed.removed.length} stale enabledModels entr${healed.removed.length === 1 ? "y" : "ies"} (${healed.removed.join(", ")})`,
+          );
+        }
+        if (healed.clearedDefault) parts.push("cleared the dangling default model");
+        ctx.ui.notify(`Cleaned up settings.json: ${parts.join("; ")}.`, "info");
+      })
+      .catch((err) => {
+        ctx.ui.notify(`settings.json cleanup failed: ${err instanceof Error ? err.message : String(err)}`, "warning");
+      });
+  });
 
   // Refresh pinned model pricing & limits (cost, contextWindow, maxTokens) at
   // session start. Deliberately NOT in the factory: factories run in
@@ -172,8 +208,8 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("openrouter-unpin", {
     description:
-      "Remove an OpenRouter provider pin from models.json. No args picks from existing pins. " +
-      "With args: /openrouter-unpin <model-id> (applies on /reload or next session)",
+      "Remove an OpenRouter provider pin from models.json (and its settings.json entry). " +
+      "No args picks from existing pins. With args: /openrouter-unpin <model-id> (applies on /reload or next session)",
     handler: async (args, ctx: ExtensionCommandContext) => {
       if (isHelpRequest(args)) {
         ctx.ui.notify(UNPIN_HELP, "info");
@@ -197,13 +233,26 @@ export default function openrouterPinExtension(pi: ExtensionAPI) {
           }
           modelId = chosen.slice(chosen.indexOf("/") + 1);
         }
-        const outcome = await performUnpin(modelsPath, modelId);
+        const outcome = await performUnpin(modelsPath, settingsPath, modelId);
         if (outcome.status === "no-providers") {
           ctx.ui.notify("No pins found (no providers in models.json)", "info");
         } else if (outcome.status === "not-found") {
           ctx.ui.notify(`No pin for "${modelId}" found (checked openrouter-* providers)`, "info");
         } else {
-          ctx.ui.notify(`Unpinned ${modelId} from models.json (applies on /reload or next session).`, "info");
+          const notes: string[] = [];
+          if (outcome.settingsChanged) {
+            notes.push(
+              outcome.clearedDefault
+                ? "removed it from settings.json and cleared the default model"
+                : "removed it from settings.json enabledModels",
+            );
+          }
+          ctx.ui.notify(
+            `Unpinned ${modelId} from models.json${
+              outcome.providers.length > 0 ? ` (${outcome.providers.join(", ")})` : ""
+            }${notes.length > 0 ? `; ${notes.join("; ")}` : ""} (applies on /reload or next session).`,
+            "info",
+          );
         }
       } catch (err) {
         ctx.ui.notify(`Unpin failed: ${err instanceof Error ? err.message : String(err)}`, "error");

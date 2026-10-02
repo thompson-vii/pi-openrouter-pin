@@ -110,8 +110,11 @@ export const PIN_HELP = [
 export const UNPIN_HELP = [
   "Usage: /openrouter-unpin [model-id]",
   "",
-  "Remove a pinned OpenRouter model from models.json (applies on /reload or",
-  "next session). Without an argument, picks from the existing pins.",
+  "Remove a pinned OpenRouter model from models.json, and its entry from",
+  "settings.json enabledModels (plus defaultProvider/defaultModel if they",
+  "pointed at it) — a leftover entry warns \"No models match pattern\" at",
+  "startup. Without an argument, picks from the existing pins. Applies on",
+  "/reload or the next session.",
   "",
   "Flags:",
   "  -h, --help           show this help",
